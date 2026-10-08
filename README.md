@@ -20,7 +20,7 @@ On each Linux machine you connect **to**: Hyprland, `wayvnc`, and SSH access fro
 omarchy pkg add wayvnc
 ```
 
-wayvnc only listens on the remote's localhost. Everything goes through one SSH connection, which also carries the tunnel.
+wayvnc runs without a password, so it never listens on a network port: it listens on a Unix socket in your runtime directory (`/run/user/<uid>`, readable only by you), and one SSH connection forwards that to another private socket on your machine. The same connection runs the setup and restore.
 
 macOS machines connect straight to Screen Sharing (`:5900`) over the tailnet. On the Mac, turn on System Settings → Sharing → Screen Sharing, and under its options "VNC viewers may control screen with password". TigerVNC can't do Apple's account login.
 
