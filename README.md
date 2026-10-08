@@ -41,7 +41,7 @@ From a terminal:
 
 ```bash
 omaremote                  # pick a machine (fzf)
-omaremote mats-beelink     # connect
+omaremote my-desktop       # connect
 omaremote --mirror host    # show the real monitor
 omaremote --h264 host      # hardware H.264
 omaremote user@host        # SSH as someone else
