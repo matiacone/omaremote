@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# View and control another computer on your tailnet.
+#
+#   omaremote                    pick an online tailnet machine
+#   omaremote [user@]host        connect to it
+#   omaremote --mirror host      show the remote's real monitor instead of a virtual screen
+#   omaremote --h264 host        hardware H.264: smoother on slow links, slightly washed-out colors
+#   omaremote list               online tailnet machines as JSON (used by the bar widget)
+#
+# Linux hosts running Hyprland: one SSH connection starts wayvnc on the remote
+# (localhost only) and carries the tunnel. By default the remote gets a headless
+# output sized to this screen and its physical monitors are switched off, so the
+# session fills the screen at native sharpness. The remote restores its monitors
+# when the session ends, or 20s after the connection drops.
+# Disconnect with F8 -> Exit viewer.
+#
+# macOS hosts: connects straight to Screen Sharing on :5900 over the tailnet.
+# Turn on System Settings -> Sharing -> Screen Sharing -> "VNC viewers may control
+# screen with password", since TigerVNC can't do Apple's login auth.
+set -euo pipefail
+
+REMOTE_PORT="${OMAREMOTE_REMOTE_PORT:-5900}"
+
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+
+notify_error() {
+  echo "omaremote: $1" >&2
+  [[ -t 2 ]] || notify-send -u critical "Remote desktop" "$1" 2>/dev/null || true
+}
+
+status_json() { tailscale status --json; }
+
+list_peers() {
+  # Machines shared into your tailnet (another user's) are listed but not offered.
+  status_json | jq '.Self.UserID as $me | [.Peer[] | select(.Online) | {
+    name: (.DNSName | split(".")[0]),
+    dns: (.DNSName | rtrimstr(".")),
+    os: .OS,
+    ip: (.TailscaleIPs[0] // ""),
+    shared: (.UserID != $me),
+    supported: ((.OS == "linux" or .OS == "macOS") and .UserID == $me)
+  }] | sort_by((if .supported then 0 else 1 end), (.name | ascii_downcase))'
+}
+
+MODE=native
+CODEC="${OMAREMOTE_CODEC:-tight}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mirror) MODE=mirror; shift ;;
+    --h264) CODEC=h264; shift ;;
+    --tight) CODEC=tight; shift ;;
+    list) list_peers; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) break ;;
+  esac
+done
+TARGET="${1:-}"
+
+STATUS="$(status_json)"
+
+if [[ -z "$TARGET" ]]; then
+  peers="$(jq -r '.Peer[] | select(.Online) | "\(.DNSName | split(".")[0])\t\(.OS)"' <<<"$STATUS" | sort)"
+  if [[ -t 0 ]]; then
+    TARGET="$(fzf --prompt='omaremote> ' --delimiter='\t' <<<"$peers" | cut -f1)"
+  else
+    TARGET="$(walker --dmenu -p 'View machine…' <<<"$peers" | cut -f1)"
+  fi
+  [[ -n "$TARGET" ]] || exit 0
+fi
+
+if [[ "$TARGET" == *@* ]]; then
+  SSH_USER="${TARGET%@*}"
+  HOST="${TARGET#*@}"
+else
+  SSH_USER="$USER"
+  HOST="$TARGET"
+fi
+HOST="${HOST%%.*}"
+
+OS="$(jq -r --arg h "$HOST" '.Peer[] | select(.HostName == $h or (.DNSName | startswith($h + "."))) | .OS' <<<"$STATUS" | head -1)"
+[[ -n "$OS" ]] || { notify_error "$HOST isn't on your tailnet"; exit 1; }
+
+if [[ "$OS" == macOS ]]; then
+  exec vncviewer -FullScreen "$HOST::5900"
+fi
+[[ "$OS" == linux ]] || { notify_error "$OS machines aren't supported yet"; exit 1; }
+
+# Runs on the remote. Prints READY once wayvnc is listening, then holds while
+# the local side's heartbeat keeps arriving, and puts the monitors back after.
+read -r -d '' REMOTE_SCRIPT <<'REMOTE' || true
+set -u
+mode=$1 w=$2 h=$3 scale=$4 port=$5 codec=$6
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
+instance=$(hyprctl instances -j 2>/dev/null | jq -r '.[0] | "\(.instance) \(.wl_socket)"' 2>/dev/null)
+[ -n "$instance" ] && [ "$instance" != "null null" ] || { echo "ERROR no Hyprland session is running there"; exit 1; }
+export HYPRLAND_INSTANCE_SIGNATURE=${instance% *} WAYLAND_DISPLAY=${instance#* }
+command -v wayvnc >/dev/null || { echo "ERROR wayvnc isn't installed there"; exit 1; }
+
+headless=OMAREMOTE-1
+ctl=$XDG_RUNTIME_DIR/omaremote-wayvncctl
+pidfile=$XDG_RUNTIME_DIR/omaremote.pid
+disabled=()
+vnc=
+
+# A session left over from a dropped connection gets to restore before we start.
+if [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null; then
+  for _ in $(seq 50); do kill -0 "$(cat "$pidfile")" 2>/dev/null || break; sleep 0.1; done
+fi
+echo $$ >"$pidfile"
+
+# Hyprland's Lua config rejects `hyprctl keyword`; runtime changes go through eval.
+heval() {
+  local r
+  r=$(hyprctl eval "$1")
+  [ "$r" = ok ] || { echo "ERROR hyprctl eval $1: $r"; return 1; }
+}
+
+restore() {
+  trap - EXIT
+  [ -n "$vnc" ] && kill "$vnc" 2>/dev/null
+  for m in "${disabled[@]}"; do hyprctl eval "hl.monitor({ output = \"$m\", disabled = false })" >/dev/null; done
+  [ "$mode" = native ] && hyprctl output remove "$headless" >/dev/null 2>&1
+  # Reload drops the runtime overrides (monitor rules, cursor setting) back to the config.
+  hyprctl reload >/dev/null
+  rm -f "$pidfile"
+}
+trap restore EXIT
+trap 'exit 0' HUP TERM INT
+
+# Hardware cursors never land in wayvnc's capture, so VNC would show no pointer.
+heval 'hl.config({ cursor = { no_hardware_cursors = true } })' || exit 1
+
+output_args=()
+if [ "$mode" = native ]; then
+  hyprctl output remove "$headless" >/dev/null 2>&1
+  hyprctl output create headless "$headless" >/dev/null
+  heval "hl.monitor({ output = \"$headless\", mode = \"${w}x${h}@60\", position = \"auto\", scale = $scale })" || exit 1
+  for m in $(hyprctl monitors -j | jq -r --arg h "$headless" '.[] | select(.name != $h) | .name'); do
+    heval "hl.monitor({ output = \"$m\", disabled = true })" || exit 1
+    disabled+=("$m")
+  done
+  output_args=(-o "$headless")
+fi
+
+# --gpu turns on hardware H.264 encoding (VAAPI).
+[ "$codec" = h264 ] && output_args+=(--gpu)
+wayvnc -f 60 -S "$ctl" "${output_args[@]}" localhost "$port" >/dev/null 2>&1 &
+vnc=$!
+for _ in $(seq 50); do
+  wayvncctl -S "$ctl" version >/dev/null 2>&1 && break
+  kill -0 "$vnc" 2>/dev/null || { echo "ERROR wayvnc failed to start"; exit 1; }
+  sleep 0.1
+done
+echo READY
+
+# The local side sends a heartbeat line every 5s. EOF means it closed; 20s of
+# silence means the network dropped. Either way, restore.
+while read -r -t 20 _; do :; done
+REMOTE
+
+LOCAL_PORT=5900
+while ss -ltnH "sport = :$LOCAL_PORT" | grep -q .; do LOCAL_PORT=$((LOCAL_PORT + 1)); done
+
+W=0 H=0 SCALE=1
+if [[ "$MODE" == native ]]; then
+  read -r W H SCALE < <(hyprctl monitors -j | jq -r '.[] | select(.focused) | "\(.width) \(.height) \(.scale)"')
+fi
+
+# The session's stdin is a pipe from this script, carrying the heartbeat.
+coproc SESSION {
+  exec ssh -o BatchMode=yes -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+    -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com \
+    -L "$LOCAL_PORT:localhost:$REMOTE_PORT" "$SSH_USER@$HOST" \
+    "bash -c $(printf '%q' "$REMOTE_SCRIPT") omaremote $MODE $W $H $SCALE $REMOTE_PORT $CODEC" 2>&1
+}
+# Coproc fds aren't visible in subshells, so the heartbeat writes through a dup.
+exec {SESSION_IN}>&"${SESSION[1]}"
+SESSION_OUT=${SESSION[0]}
+
+# Heartbeat for the remote. It stops (closing the pipe) within 5s of this script dying.
+( while kill -0 $$ 2>/dev/null; do echo || exit; sleep 5; done ) >&"$SESSION_IN" &
+HEARTBEAT_PID=$!
+
+finish() {
+  kill "$HEARTBEAT_PID" 2>/dev/null || true
+  exec {SESSION_IN}>&- 2>/dev/null || true
+  [[ -n "${SESSION[1]:-}" ]] && eval "exec ${SESSION[1]}>&-" 2>/dev/null || true
+  for _ in $(seq 50); do kill -0 "$SESSION_PID" 2>/dev/null || break; sleep 0.1; done
+  kill "$SESSION_PID" 2>/dev/null || true
+}
+trap finish EXIT
+trap 'exit 130' INT TERM HUP
+
+[[ "$MODE" == native ]] && echo "Connecting to $HOST (${W}x${H} @${SCALE}x)..." || echo "Connecting to $HOST..."
+ready=0
+while IFS= read -r line <&"$SESSION_OUT"; do
+  case "$line" in
+    READY) ready=1; break ;;
+    ERROR*) notify_error "$HOST: ${line#ERROR }"; exit 1 ;;
+    *) echo "$line" >&2 ;;
+  esac
+done
+[[ $ready == 1 ]] || { notify_error "couldn't open an SSH session to $SSH_USER@$HOST"; exit 1; }
+
+# AlwaysCursor only paints a local pointer when the server sends an empty one.
+viewer_args=(-AlwaysCursor -CursorType=System)
+[[ "$MODE" == native ]] && viewer_args+=(-FullScreen)
+# Without AutoSelect=0 TigerVNC ignores the preference and the server picks Tight.
+[[ "$CODEC" == h264 ]] && viewer_args+=(-AutoSelect=0 -PreferredEncoding=H.264)
+vncviewer "${viewer_args[@]}" "localhost:$LOCAL_PORT"

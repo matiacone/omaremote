@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.matiacone.omaremote",
+  "name": "Omaremote",
+  "version": "1.0.0",
+  "author": "Mathew",
+  "license": "MIT",
+  "description": "View and control the other computers on your tailnet from the Omarchy bar: pick a machine and its desktop opens fullscreen at your screen's resolution",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omaremote",
+    "description": "Lists your online tailnet machines. Click one to view and control its desktop.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "mirror": false,
+      "h264": false
+    },
+    "schema": [
+      {
+        "key": "mirror",
+        "type": "boolean",
+        "label": "Mirror the real monitor",
+        "defaultValue": false,
+        "description": "Show the remote's own monitor in a window, instead of a fullscreen virtual screen sized to yours"
+      },
+      {
+        "key": "h264",
+        "type": "boolean",
+        "label": "H.264",
+        "defaultValue": false,
+        "description": "Hardware video encoding: smoother on slow links and for video, slightly washed-out colors"
+      }
+    ]
+  }
+}
